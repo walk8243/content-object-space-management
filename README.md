@@ -1,58 +1,77 @@
 # content-object-space-management
 
-![banner](./docs/banner.png)
+![バナー](./docs/banner.jpg)
 
 COSMは「空間・物体・型」の3階層モデルでメディア資産を最適化する管理システムです。Next.jsとSpring Bootによる柔軟な入稿基盤に加え、パフォーマンスを追求したRust製変換ワーカーを搭載。非同期実行により、負荷の高い処理を分離し、任意のタイミングでの高速変換を実現します。配信層にはTypeScriptを採用し、S3互換ストレージとKubernetesを組み合わせることで、大規模運用に耐えうる極めて高いスケーラビリティを提供します。
 
-## システム全体構成（マイクロサービスアーキテクチャ）
+## システム構成の基本方針
 
-各機能を独立したサービスとして構築し、**メッセージキュー（RabbitMQ や Kafka 等）**を介して非同期に連携させることで、変換処理の遅延実行とスケーラビリティを確保します。
+1. **疎結合なマイクロサービス** : 各コンポーネントを独立させ、スケーリングや障害の影響範囲を最小化する。
+2. **イベント駆動型（Pullモデル）の非同期処理** : メディア変換という重い処理をPub/Subを介したPull型にすることで、ワーカー側の負荷制御（バックプレッシャー）と長時間処理の安定性を確保。
+3. **データ一貫性の分離** : メタデータ（PostgreSQL）と実ファイル（GCS）の整合性は、Ingestion APIが司令塔となって担保する。
+4. **ポータビリティと開発効率** : 全コンポーネントをDocker化し、本番（GKE/GCP）と開発環境（Local/Emulator）で同一のロジックが動くようにする。
+5. **3階層（Space/Object/Type）による論理管理** : ストレージの物理パスとDBの論理構造を一致させ、運用の透明性を高める。
 
-- Web UI (Next.js): 管理画面。API 経由でメディアの状態確認、アップロード指示、変換リクエストを行う。
-- Ingestion API (Spring Boot): 入稿の司令塔。MySQL へのメタデータ書き込み、S3 へのアップロード処理、変換ジョブのキューイングを担当。
-- Conversion Worker (Rust): CPU 集約型の変換処理を担当。キューからジョブを受け取り、FFmpeg 等を利用して変換。
-- Distribution Service (TypeScript): 配信専用の軽量プロキシ/ゲートウェイ。
-- Data Store: MySQL (メタデータ) + S3 互換ストレージ (実ファイル)。
+## コンポーネント
+
+![アーキテクチャ](./docs/architect.jpg)
+
+|コンポーネント|技術スタック|主な責務|
+|---|---|---|
+|Web UI|Next.js|ユーザー/管理者向け画面。ファイルのアップロード指示、管理、変換リクエスト。|
+|Ingestion API|Spring Boot|システムの司令塔。メタデータ管理、GCSへの初回アップロード、変換ジョブのPub/Sub発行。|
+|Conversion Worker|Rust|高性能変換エンジン。Pub/SubからジョブをPullし、FFmpeg等を用いてメディアを変換。|
+|Distribution Service|Bun(TypeScript)|コンテンツ配信プロキシ。認証チェック、GCSへのセキュアなアクセス、スケーラブルな配信。|
+|Metadata Store|PostgreSQL|空間・物体・型のリレーション、各ファイルのメタデータ（JSONB形式）の永続化。|
+|Blob Storage|GCS|メディアファイル実体の保存先。S3互換モードまたはJSON APIを利用。|
+|Message Broker|Cloud Pub/Sub|IngestionからWorkerへジョブを伝達するためのメッセージ基盤。|
 
 ```mermaid
 graph TD
-    subgraph Client_Layer [Client Layer]
-        UI[Next.js WebUI]
-    end
+    User((End User))
+    Admin((Admin))
 
-    subgraph K8s_Cluster [Kubernetes Cluster]
-        direction TB
-        
+    subgraph GCP [Google Cloud Platform]
+        Dist[Bun Distribution Service]
+        UI[Next.js WebUI]
+
         API[Spring Boot Ingestion API]
         Worker[Rust Conversion Worker]
-        Dist[TypeScript Distribution Service]
-        MQ[[Message Queue / RabbitMQ]]
-        
-        UI <-->|REST API| API
-        API -->|Metadata| DB[(MySQL)]
-        API -->|Upload| S3[(S3 Compatible Storage)]
-        API -->|Job Request| MQ
-        
-        MQ -->|Consume Job| Worker
-        Worker -->|Read Original| S3
-        Worker -->|Write Transcoded| S3
-        Worker -->|Update Status| DB
-        
-        Dist -->|Read Metadata| DB
-        Dist -->|Serve Content| S3
+
+        DB[(Cloud SQL: PostgreSQL)]
+        GCS[(Google Cloud Storage)]
+        PS[[Cloud Pub/Sub]]
     end
 
-    User((End User)) <-->|Download/Stream| Dist
-    Admin((Admin)) <-->|Manage/Upload| UI
+    %% 接続関係：一般ユーザー（下から）
+    Dist -->|Access| User
 
-    %% Styling
+    %% 接続関係：管理者
+    Admin -->|Manage| UI
+    UI <-->|Control| API
+
+    %% GKE内部の連携
+    API -->|Job Publish| PS
+    PS <-. Pull Job .-> Worker
+    
+    %% ストレージ・DBへのアクセス
+    DB -->|Read| Dist
+    GCS -->|Stream| Dist
+    
+    API -->|Metadata| DB
+    API -->|Upload| GCS
+    
+    Worker <-->|Process| GCS
+    Worker -->|Status| DB
+
+    %% スタイリング
     style UI fill:#0070f3,color:#fff
     style API fill:#6db33f,color:#fff
     style Worker fill:#dea584,color:#000
-    style Dist fill:#3178c6,color:#fff
-    style DB fill:#4479a1,color:#fff
-    style S3 fill:#ff9900,color:#fff
-    style MQ fill:#ff6600,color:#fff
+    style Dist fill:#000,color:#f9f1e1
+    style DB fill:#336791,color:#fff
+    style GCS fill:#4285f4,color:#fff
+    style PS fill:#34a853,color:#fff
 ```
 
 ## 「空間・物体・型」のデータモデル設計
@@ -60,7 +79,7 @@ graph TD
 |階層|単位|主な役割|
 |---|---|---|
 |空間 (Space)|チーム / プロジェクト|権限管理、クォータ制限、配信設定の分離。|
-|物体 (Object)|アセット ID,「ある一つの動画」や「ある一つの写真」という概念。論理的な一塊。|
+|物体 (Object)|アセット ID|「ある一つの動画」や「ある一つの写真」という概念。論理的な一塊。|
 |型 (Type)|ファイル実体|original, hls_720p, thumbnail_png など、用途別の変換済みファイル。|
 
 ## 変換処理 (Rust) の切り離し
